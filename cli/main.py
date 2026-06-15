@@ -874,6 +874,141 @@ def display_complete_report(final_state):
             console.print(Panel(Markdown(risk["judge_decision"]), title="Portfolio Manager", border_style="blue", padding=(1, 2)))
 
 
+def _prompt_alpaca_execution(ticker: str, final_state: dict):
+    """Offer to execute the trade decision via Alpaca Markets."""
+    import re
+
+    # Check if alpaca-py is installed
+    try:
+        import alpaca  # noqa: F401
+    except ImportError:
+        console.print(
+            "\n[dim]Tip: Install alpaca-py to enable live trade execution (pip install alpaca-py)[/dim]"
+        )
+        return
+
+    # Check credentials are available
+    if not os.environ.get("ALPACA_API_KEY") or not os.environ.get("ALPACA_SECRET_KEY"):
+        console.print(
+            "\n[dim]Tip: Set ALPACA_API_KEY and ALPACA_SECRET_KEY to enable live trade execution[/dim]"
+        )
+        return
+
+    from tradingagents.execution.alpaca import (
+        execute_from_portfolio_decision,
+        get_account_info,
+        get_position,
+    )
+    from tradingagents.agents.schemas import PortfolioRating
+
+    # Parse rating from final_trade_decision text
+    decision_text = final_state.get("final_trade_decision", "") or ""
+    if not decision_text:
+        risk = final_state.get("risk_debate_state", {}) or {}
+        decision_text = risk.get("judge_decision", "") or ""
+
+    rating = None
+    rating_pattern = re.search(
+        r"\*{0,2}Rating\*{0,2}[:\s]+([A-Za-z]+)", decision_text, re.IGNORECASE
+    )
+    if rating_pattern:
+        raw = rating_pattern.group(1).strip().capitalize()
+        try:
+            rating = PortfolioRating(raw)
+        except ValueError:
+            pass
+
+    if rating is None:
+        console.print("\n[yellow]Could not parse a rating from the final decision — skipping trade execution.[/yellow]")
+        return
+
+    # Show decision summary
+    paper = os.environ.get("ALPACA_PAPER", "true").strip().lower() in ("true", "1", "yes")
+    mode_label = "[yellow]PAPER[/yellow]" if paper else "[bold red]LIVE[/bold red]"
+    console.print(f"\n[bold]Trade Execution via Alpaca ({mode_label})[/bold]")
+    console.print(f"  Ticker : [cyan]{ticker}[/cyan]")
+    console.print(f"  Rating : [bold]{rating.value}[/bold]")
+
+    if rating == PortfolioRating.HOLD:
+        console.print("  Decision is [bold]HOLD[/bold] — no order will be placed.")
+        return
+
+    execute_choice = typer.prompt(
+        "\nExecute this trade on Alpaca?", default="N"
+    ).strip().upper()
+    if execute_choice not in ("Y", "YES"):
+        console.print("[dim]Trade execution skipped.[/dim]")
+        return
+
+    # Show account info
+    try:
+        account = get_account_info()
+        console.print(
+            f"  Account: status={account['status']} | "
+            f"buying_power=${account['buying_power']:,.2f} | "
+            f"portfolio=${account['portfolio_value']:,.2f}"
+        )
+        pos = get_position(ticker)
+        if pos:
+            console.print(
+                f"  Position: {pos['qty']} shares | "
+                f"value=${pos['market_value']:,.2f} | "
+                f"P&L=${pos['unrealized_pl']:,.2f}"
+            )
+    except Exception as exc:
+        console.print(f"[red]Could not fetch account info: {exc}[/red]")
+        return
+
+    # Get notional amount
+    notional_str = typer.prompt("Dollar amount to trade (e.g. 1000)", default="1000").strip()
+    try:
+        notional = float(notional_str.replace(",", "").replace("$", ""))
+    except ValueError:
+        console.print("[red]Invalid amount — skipping.[/red]")
+        return
+
+    # Optional limit price
+    limit_str = typer.prompt(
+        "Limit price (press Enter for market order)", default=""
+    ).strip()
+    limit_price = None
+    if limit_str:
+        try:
+            limit_price = float(limit_str.replace(",", "").replace("$", ""))
+        except ValueError:
+            console.print("[yellow]Invalid limit price — using market order.[/yellow]")
+
+    # Final confirmation
+    order_type = f"limit @ ${limit_price}" if limit_price else "market"
+    side_label = "BUY" if rating in (PortfolioRating.BUY, PortfolioRating.OVERWEIGHT) else "SELL"
+    console.print(
+        f"\n[bold]Confirm:[/bold] {side_label} ${notional:,.2f} of {ticker} "
+        f"({order_type}) on Alpaca ({mode_label})"
+    )
+    confirm = typer.prompt("Proceed? (yes/no)", default="no").strip().lower()
+    if confirm not in ("yes", "y"):
+        console.print("[dim]Order cancelled.[/dim]")
+        return
+
+    result = execute_from_portfolio_decision(
+        symbol=ticker,
+        rating=rating,
+        notional=notional,
+        limit_price=limit_price,
+    )
+
+    if result.success:
+        console.print(f"\n[green]✓ Order submitted[/green]")
+        console.print(f"  Order ID : {result.order_id or 'N/A'}")
+        console.print(f"  Symbol   : {result.symbol}")
+        console.print(f"  Side     : {result.side}")
+        console.print(f"  Status   : {result.status}")
+        if result.filled_price:
+            console.print(f"  Fill price: ${result.filled_price:,.4f}")
+    else:
+        console.print(f"\n[red]✗ Order failed:[/red] {result.message}")
+
+
 def update_research_team_status(status):
     """Update status for research team members (not Trader)."""
     research_team = ["Bull Researcher", "Bear Researcher", "Research Manager"]
@@ -1312,6 +1447,9 @@ def run_analysis(checkpoint: bool = False):
     display_choice = typer.prompt("\nDisplay full report on screen?", default="Y").strip().upper()
     if display_choice in ("Y", "YES", ""):
         display_complete_report(final_state)
+
+    # Prompt to execute trade via Alpaca
+    _prompt_alpaca_execution(selections["ticker"], final_state)
 
 
 @app.command()

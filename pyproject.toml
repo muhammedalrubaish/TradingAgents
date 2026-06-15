@@ -44,6 +44,10 @@ dev = [
 bedrock = [
     "langchain-aws>=1.5.0",
 ]
+# Alpaca Markets trade execution. pip install "tradingagents[alpaca]"
+alpaca = [
+    "alpaca-py>=0.38.0",
+]
 
 [project.scripts]
 tradingagents = "cli.main:app"
